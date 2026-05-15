@@ -5,7 +5,281 @@ date: "2026-05-15"
 output: html_document
 ---
 
+Link de repositorio en Git: https://github.com/Ikeel04/Lab10-MD.git 
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# Librerías
+
+```{r librerias}
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(scales)
+```
+
+
+# Selección del Conjunto de Datos
+
+## Origen y Justificación
+Se utilizó el dataset **Heart Disease** disponible públicamente en Kaggle
+(https://www.kaggle.com/datasets/johnsmith88/heart-disease-dataset), el cual fue originalmente
+recopilado por el Cleveland Heart Disease Institute y forma parte del repositorio UCI Machine
+Learning Repository.
+
+Este dataset resulta especialmente apropiado para aprendizaje semi-supervisado porque representa un escenario médico real donde obtener diagnósticos etiquetados es costoso y requiere personal especializado, mientras que datos clínicos básicos (no etiquetados) son fáciles de recopilar. Cuenta con 1,025 filas y 14 columnas (13 predictoras + 1 variable respuesta), cumpliendo los requisitos mínimos del laboratorio. Se puede ver que la variable objetivo es binaria y las clases están razonablemente balanceadas, lo que facilita la evaluación de métricas.
+
+## Carga del Dataset
+
+```{r carga}
+heart <- read.csv("heart.csv")
+
+cat("Dimensiones:", nrow(heart), "filas ×", ncol(heart), "columnas\n")
+```
+
+# Análisis Exploratorio de Datos
+
+## Estructura General
+
+```{r estructura}
+str(heart)
+```
+
+```{r resumen}
+summary(heart)
+```
+
+El dataset contiene **`r nrow(heart)` observaciones** y **`r ncol(heart)` variables**, todas
+numéricas. La variable respuesta es `target` (0 = sin enfermedad cardíaca, 1 = con
+enfermedad cardíaca).
+
+## Descripción de Variables
+
+```{r tabla de variables, echo=FALSE}
+vars <- data.frame(
+  Variable  = c("age", "sex", "cp", "trestbps", "chol", "fbs",
+                "restecg", "thalach", "exang", "oldpeak", "slope", "ca", "thal", "target"),
+  Tipo      = c("Continua", "Binaria", "Categórica (0-3)", "Continua", "Continua", "Binaria",
+                "Categórica (0-2)", "Continua", "Binaria", "Continua",
+                "Categórica (0-2)", "Ordinal (0-4)", "Categórica (0-3)", "Binaria"),
+  Descripción = c(
+    "Edad del paciente (años)",
+    "Sexo (1 = masculino, 0 = femenino)",
+    "Tipo de dolor en el pecho (0=asintomático, 1=angina atípica, 2=no anginoso, 3=angina típica)",
+    "Presión arterial en reposo (mmHg)",
+    "Colesterol sérico (mg/dl)",
+    "Azúcar en sangre en ayunas > 120 mg/dl (1 = verdadero)",
+    "Resultados del ECG en reposo (0=normal, 1=anormalidad ST-T, 2=hipertrofia VI)",
+    "Frecuencia cardíaca máxima alcanzada (bpm)",
+    "Angina inducida por ejercicio (1 = sí)",
+    "Depresión del segmento ST inducida por ejercicio",
+    "Pendiente del segmento ST en ejercicio pico (0=descendente, 1=plana, 2=ascendente)",
+    "Número de vasos principales coloreados por fluoroscopía (0-4)",
+    "Tipo de talasemia (0=normal, 1=defecto fijo, 2=defecto reversible, 3=desconocido)",
+    "Diagnóstico de enfermedad cardíaca (0 = ausente, 1 = presente)"
+  )
+)
+
+kable(vars, caption = "Diccionario de variables – Heart Disease Dataset") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 13)
+```
+
+## Valores Faltantes
+
+```{r nulos}
+nulos <- colSums(is.na(heart))
+cat("Total de valores faltantes por columna:\n")
+print(nulos)
+cat("\nTotal:", sum(nulos), "→ El dataset no requiere imputación.\n")
+```
+
+## Balance de Clases
+
+```{r balance}
+dist_target <- heart %>%
+  count(target) %>%
+  mutate(
+    Clase      = ifelse(target == 1, "Con enfermedad (1)", "Sin enfermedad (0)"),
+    Porcentaje = round(n / sum(n) * 100, 1)
+  )
+
+kable(dist_target[, c("Clase", "n", "Porcentaje")],
+      col.names = c("Clase", "N", "%"),
+      caption = "Distribución de la variable respuesta") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r plot-balance, fig.cap="Distribución de clases en la variable respuesta"}
+ggplot(dist_target, aes(x = Clase, y = Porcentaje, fill = Clase)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(Porcentaje, "%")), vjust = -0.5, size = 4.5) +
+  scale_fill_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Balance de clases – Heart Disease",
+       x = "", y = "Porcentaje (%)") +
+  ylim(0, 65) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+Las clases están razonablemente balanceadas, lo que es favorable para el aprendizaje
+semi-supervisado: el modelo tiene una referencia equilibrada incluso con pocos datos etiquetados.
+
+## Estadísticas Descriptivas por Variable Continua
+
+```{r stats continuas}
+continuas <- c("age", "trestbps", "chol", "thalach", "oldpeak")
+
+stats <- heart %>%
+  select(all_of(continuas)) %>%
+  summarise(across(everything(), list(
+    Media  = ~round(mean(.), 2),
+    Mediana= ~round(median(.), 2),
+    DE     = ~round(sd(.), 2),
+    Min    = ~min(.),
+    Max    = ~max(.)
+  ))) %>%
+  pivot_longer(everything(), names_to = c("Variable", "Estadístico"),
+               names_sep = "_") %>%
+  pivot_wider(names_from = Estadístico, values_from = value)
+
+kable(stats, caption = "Estadísticas descriptivas – variables continuas") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Distribución de Variables Continuas
+
+```{r histogramas, fig.height=7, fig.cap="Distribución de variables continuas"}
+heart %>%
+  select(all_of(continuas), target) %>%
+  mutate(target = factor(target, labels = c("Sin enfermedad", "Con enfermedad"))) %>%
+  pivot_longer(-target, names_to = "Variable", values_to = "Valor") %>%
+  ggplot(aes(x = Valor, fill = target)) +
+  geom_histogram(bins = 25, alpha = 0.7, position = "identity") +
+  facet_wrap(~ Variable, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Distribución de variables continuas por clase",
+       x = "", y = "Frecuencia", fill = "Clase") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+Se observa que la frecuencia cardíaca máxima (`thalach`) y la depresión del segmento ST
+(`oldpeak`) presentan las diferencias más marcadas entre pacientes con y sin enfermedad
+cardíaca, lo que sugiere alto poder discriminativo para los modelos.
+
+## Distribución de Variables Categóricas
+
+```{r categoricas, fig.height=6, fig.cap="Variables categóricas por clase"}
+categoricas <- c("cp", "restecg", "slope", "ca", "thal")
+
+heart %>%
+  select(all_of(categoricas), target) %>%
+  mutate(target = factor(target, labels = c("Sin enfermedad", "Con enfermedad"))) %>%
+  pivot_longer(-target, names_to = "Variable", values_to = "Valor") %>%
+  mutate(Valor = as.factor(Valor)) %>%
+  ggplot(aes(x = Valor, fill = target)) +
+  geom_bar(position = "dodge", alpha = 0.85) +
+  facet_wrap(~ Variable, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Variables categóricas por clase de diagnóstico",
+       x = "Categoría", y = "Frecuencia", fill = "Clase") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## Análisis de Correlación
+
+```{r correlacion, fig.cap="Mapa de correlación entre variables numéricas"}
+M <- cor(heart)
+corrplot(M,
+         method  = "color",
+         type    = "upper",
+         tl.cex  = 0.85,
+         addCoef.col = "black",
+         number.cex  = 0.65,
+         col     = colorRampPalette(c("#e74c3c", "white", "#2980b9"))(200),
+         title   = "Matriz de correlación – Heart Disease",
+         mar     = c(0, 0, 1, 0))
+```
+
+```{r correlacion-target}
+cor_target <- sort(abs(cor(heart)[, "target"]), decreasing = TRUE)
+cor_df <- data.frame(
+  Variable    = names(cor_target),
+  Correlacion = round(cor(heart)[names(cor_target), "target"], 3)
+)
+
+kable(cor_df[-1, ], row.names = FALSE,
+      caption = "Correlación de cada variable con la variable respuesta (target)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r plot-correlacion-target, fig.cap="Correlación con la variable respuesta"}
+ggplot(cor_df[-1, ], aes(x = reorder(Variable, abs(Correlacion)),
+                          y = Correlacion,
+                          fill = Correlacion > 0)) +
+  geom_col(width = 0.65) +
+  coord_flip() +
+  scale_fill_manual(values = c("#e74c3c", "#27ae60"),
+                    labels = c("Negativa", "Positiva")) +
+  labs(title = "Correlación de predictoras con target",
+       x = "", y = "Correlación de Pearson", fill = "Dirección") +
+  theme_minimal(base_size = 13)
+```
+
+Las variables con mayor correlación absoluta con `target` son:
+
+- **`cp`** (tipo de dolor en el pecho): correlación positiva, pacientes con angina típica tienen mayor probabilidad de enfermedad.
+- **`thalach`** (frecuencia cardíaca máxima): correlación positiva, frecuencias más altas asociadas a presencia de enfermedad.
+- **`exang`** (angina por ejercicio): correlación negativa, su presencia está asociada a diagnóstico positivo.
+- **`oldpeak`** (depresión ST): correlación negativa, valores altos indican mayor riesgo.
+- **`ca`** (vasos principales): correlación negativa marcada, más vasos obstruidos indican enfermedad.
+
+## Boxplots: Variables Continuas por Clase
+
+```{r boxplots, fig.height=6, fig.cap="Distribución de variables continuas por diagnóstico"}
+heart %>%
+  select(all_of(continuas), target) %>%
+  mutate(target = factor(target, labels = c("Sin enfermedad", "Con enfermedad"))) %>%
+  pivot_longer(-target, names_to = "Variable", values_to = "Valor") %>%
+  ggplot(aes(x = target, y = Valor, fill = target)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Variables continuas por clase de diagnóstico",
+       x = "", y = "", fill = "Clase") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank())
+```
+
+## Preprocesamiento
+
+Las variables categóricas (`cp`, `restecg`, `slope`, `thal`) serán tratadas como factores en
+los modelos que lo requieran. Para los algoritmos semi-supervisados se aplicará
+**estandarización** (media 0, desviación estándar 1) sobre todas las variables numéricas,
+utilizando exclusivamente los parámetros del conjunto de entrenamiento para evitar data leakage.
+
+```{r preprocesamiento}
+# Convertir variables categóricas a factor
+cat_vars <- c("sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal", "target")
+heart_factor <- heart %>%
+  mutate(across(all_of(cat_vars), as.factor))
+
+str(heart_factor)
+
+cat("\nResumen de la variable respuesta tras preprocesamiento:\n")
+print(table(heart_factor$target))
+```
+
+El dataset queda listo para el diseño experimental: sin valores faltantes, con variables
+categóricas correctamente tipificadas y con clases balanceadas. La estandarización de variables
+continuas se aplicará dentro de cada partición experimental para evitar contaminación entre
+conjuntos de entrenamiento y prueba.
+```
