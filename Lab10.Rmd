@@ -21,6 +21,10 @@ library(knitr)
 library(kableExtra)
 library(tidyr)
 library(scales)
+library(randomForest)
+library(dplyr)
+library(FNN)
+library(caret)
 ```
 
 
@@ -282,4 +286,299 @@ El dataset queda listo para el diseño experimental: sin valores faltantes, con 
 categóricas correctamente tipificadas y con clases balanceadas. La estandarización de variables
 continuas se aplicará dentro de cada partición experimental para evitar contaminación entre
 conjuntos de entrenamiento y prueba.
+
+# Diseño experimental
+```{r}
+set.seed(123)
+
+heart$target <- as.factor(heart$target)
+
+train_index <- createDataPartition(heart$target, p = 0.7, list = FALSE)
+
+train_data <- heart[train_index, ]
+test_data  <- heart[-train_index, ]
+
+train_data$target <- as.factor(train_data$target)
+test_data$target <- as.factor(test_data$target)
+
+dim(train_data)
+dim(test_data)
 ```
+El dataset fue dividido en un conjunto de entrenamiento (70%) y uno de prueba (30%) utilizando muestreo estratificado con createDataPartition(). Esto permite mantener una distribución similar de las clases en ambos conjuntos. Los datos de entrenamiento se utilizarán para construir los modelos, mientras que los datos de prueba servirán para evaluar su desempeño.
+
+```{r porcentajes-etiquetados}
+porcentajes_etiquetados <- c(0.05, 0.10, 0.20)
+porcentajes_etiquetados
+
+set.seed(123)
+
+crear_particion_semi <- function(data, porcentaje) {
+  labeled_index <- createDataPartition(
+    data$target,
+    p = porcentaje,
+    list = FALSE
+  )
+  
+  labeled_data <- data[labeled_index, ]
+  unlabeled_data <- data[-labeled_index, ]
+  
+  labeled_data$target <- as.factor(labeled_data$target)
+  unlabeled_data$target <- NA
+  
+  list(
+    labeled = labeled_data,
+    unlabeled = unlabeled_data
+  )
+}
+
+particion_5  <- crear_particion_semi(train_data, 0.05)
+particion_10 <- crear_particion_semi(train_data, 0.10)
+particion_20 <- crear_particion_semi(train_data, 0.20)
+
+data.frame(
+  porcentaje = c("5%", "10%", "20%"),
+  etiquetados = c(
+    nrow(particion_5$labeled),
+    nrow(particion_10$labeled),
+    nrow(particion_20$labeled)
+  ),
+  no_etiquetados = c(
+    nrow(particion_5$unlabeled),
+    nrow(particion_10$unlabeled),
+    nrow(particion_20$unlabeled)
+  )
+)
+```
+Para simular un escenario de aprendizaje semi supervisado, se utilizaron diferentes porcentajes de datos etiquetados dentro del conjunto de entrenamiento: 5%, 10% y 20%. El resto de las observaciones fueron consideradas como datos no etiquetados, reemplazando temporalmente la variable objetivo por valores NA. Esto permitirá comparar el desempeño de modelos supervisados y semi supervisados bajo distintas cantidades de información etiquetada.
+
+```{r preparar-modelos}
+evaluar_modelo <- function(predicciones, reales, nombre_modelo, porcentaje) {
+  cm <- confusionMatrix(
+    data = as.factor(predicciones),
+    reference = as.factor(reales),
+    positive = "1"
+  )
+  
+  data.frame(
+    modelo = nombre_modelo,
+    porcentaje_etiquetado = porcentaje,
+    accuracy = cm$overall["Accuracy"],
+    precision = cm$byClass["Precision"],
+    recall = cm$byClass["Recall"],
+    f1 = cm$byClass["F1"]
+  )
+}
+```
+Esta función se utiliza para evaluar el desempeño de los modelos implementados. A partir de las predicciones generadas y las etiquetas reales del conjunto de prueba, se calcula la matriz de confusión y se obtienen métricas de evaluación como accuracy, precision, recall y F1-score. Estas métricas permiten comparar objetivamente el rendimiento de los modelos supervisados y semi supervisados.
+
+```{r modelo supervisado}
+entrenar_supervisado <- function(particion, test_data, porcentaje) {
+  labeled_data <- particion$labeled
+  labeled_data$target <- as.factor(labeled_data$target)
+  
+  modelo <- randomForest(
+    target ~ .,
+    data = labeled_data,
+    ntree = 300
+  )
+  
+  predicciones <- predict(modelo, newdata = test_data)
+  
+  evaluar_modelo(
+    predicciones = predicciones,
+    reales = test_data$target,
+    nombre_modelo = "Supervisado - Random Forest",
+    porcentaje = porcentaje
+  )
+}
+```
+Este modelo corresponde al enfoque supervisado tradicional utilizado como baseline. El algoritmo Random Forest se entrena únicamente con los datos etiquetados disponibles y posteriormente realiza predicciones sobre el conjunto de prueba. Los resultados obtenidos permiten comparar el desempeño del aprendizaje supervisado frente a los métodos semi supervisados implementados.
+
+```{r modelo self-training}
+entrenar_self_training_v2 <- function(particion, test_data, porcentaje,
+                                      threshold = 0.85, max_iter = 5) {
+  
+  labeled_data <- particion$labeled
+  unlabeled_data <- particion$unlabeled
+  
+  labeled_data$target <- as.factor(labeled_data$target)
+  niveles <- levels(labeled_data$target)
+  
+  for (i in 1:max_iter) {
+    
+    unlabeled_features <- unlabeled_data %>%
+      select(-target)
+    
+    modelo <- randomForest(
+      target ~ .,
+      data = labeled_data,
+      ntree = 300
+    )
+    
+    probabilidades <- predict(
+      modelo,
+      newdata = unlabeled_features,
+      type = "prob"
+    )
+    
+    confianza <- apply(probabilidades, 1, max)
+    pseudo_labels <- colnames(probabilidades)[apply(probabilidades, 1, which.max)]
+    
+    seleccionados <- which(confianza >= threshold)
+    
+    if (length(seleccionados) == 0) {
+      break
+    }
+    
+    nuevos_datos <- unlabeled_features[seleccionados, , drop = FALSE]
+    
+    nuevos_datos <- cbind(
+      nuevos_datos,
+      target = factor(pseudo_labels[seleccionados], levels = niveles)
+    )
+    
+    labeled_data <- bind_rows(labeled_data, nuevos_datos)
+    unlabeled_data <- unlabeled_data[-seleccionados, , drop = FALSE]
+    
+    if (nrow(unlabeled_data) == 0) {
+      break
+    }
+  }
+  
+  modelo_final <- randomForest(
+    target ~ .,
+    data = labeled_data,
+    ntree = 300
+  )
+  
+  predicciones <- predict(modelo_final, newdata = test_data)
+  
+  evaluar_modelo(
+    predicciones = predicciones,
+    reales = test_data$target,
+    nombre_modelo = "Semi-supervisado - Self-Training RF",
+    porcentaje = porcentaje
+  )
+}
+```
+Este modelo implementa Self-Training utilizando Random Forest. Inicialmente, el modelo se entrena únicamente con los datos etiquetados y posteriormente genera predicciones sobre los datos no etiquetados. Las observaciones con mayor nivel de confianza son seleccionadas y agregadas al conjunto etiquetado como pseudo-etiquetas. Este proceso se repite iterativamente para aprovechar la información de los datos sin etiqueta y mejorar el entrenamiento del modelo.
+
+```{r modelo label-propagation}
+entrenar_label_propagation <- function(particion, test_data, porcentaje,
+                                       k = 7, alpha = 0.8, iteraciones = 100) {
+  
+  labeled_data <- particion$labeled
+  unlabeled_data <- particion$unlabeled
+  
+  labeled_data$target <- as.factor(labeled_data$target)
+  niveles <- levels(labeled_data$target)
+  
+  semi_data <- bind_rows(labeled_data, unlabeled_data)
+  
+  indices_etiquetados <- 1:nrow(labeled_data)
+  
+  X <- semi_data %>%
+    select(-target)
+  
+  X <- model.matrix(~ ., data = X)[, -1]
+  X <- scale(X)
+  
+  knn <- get.knn(X, k = k)
+  
+  n <- nrow(X)
+  W <- matrix(0, nrow = n, ncol = n)
+  
+  sigma <- median(knn$nn.dist)
+  
+  for (i in 1:n) {
+    vecinos <- knn$nn.index[i, ]
+    distancias <- knn$nn.dist[i, ]
+    pesos <- exp(-(distancias^2) / (2 * sigma^2))
+    W[i, vecinos] <- pesos
+  }
+  
+  W <- W / rowSums(W)
+  W[is.na(W)] <- 0
+  
+  Y <- matrix(0, nrow = n, ncol = length(niveles))
+  colnames(Y) <- niveles
+  
+  for (i in indices_etiquetados) {
+    Y[i, as.character(labeled_data$target[i])] <- 1
+  }
+  
+  F <- Y
+  
+  for (i in 1:iteraciones) {
+    F <- alpha * W %*% F + (1 - alpha) * Y
+    F[indices_etiquetados, ] <- Y[indices_etiquetados, ]
+  }
+  
+  pseudo_labels <- colnames(F)[max.col(F)]
+  
+  semi_data_completo <- semi_data %>%
+    select(-target)
+  
+  semi_data_completo$target <- factor(
+    pseudo_labels,
+    levels = niveles
+  )
+  
+  modelo_final <- randomForest(
+    target ~ .,
+    data = semi_data_completo,
+    ntree = 300
+  )
+  
+  predicciones <- predict(modelo_final, newdata = test_data)
+  
+  evaluar_modelo(
+    predicciones = predicciones,
+    reales = test_data$target,
+    nombre_modelo = "Semi-supervisado - Label Propagation",
+    porcentaje = porcentaje
+  )
+}
+```
+Este modelo utiliza Label Propagation, un método semi supervisado basado en grafos. Primero se combinan los datos etiquetados y no etiquetados, y luego se construye una red de similitud utilizando k-NN. Las etiquetas conocidas se propagan iterativamente hacia los datos sin etiqueta para generar pseudo-etiquetas, las cuales posteriormente son utilizadas para entrenar un modelo Random Forest.
+
+```{r}
+resultados <- bind_rows(
+  entrenar_supervisado(particion_5, test_data, "5%"),
+  entrenar_supervisado(particion_10, test_data, "10%"),
+  entrenar_supervisado(particion_20, test_data, "20%"),
+  
+  entrenar_self_training_v2(particion_5, test_data, "5%"),
+  entrenar_self_training_v2(particion_10, test_data, "10%"),
+  entrenar_self_training_v2(particion_20, test_data, "20%"),
+  
+  entrenar_label_propagation(particion_5, test_data, "5%"),
+  entrenar_label_propagation(particion_10, test_data, "10%"),
+  entrenar_label_propagation(particion_20, test_data, "20%")
+)
+
+resultados
+```
+Los resultados muestran que el desempeño de los modelos mejora conforme aumenta el porcentaje de datos etiquetados disponibles. En escenarios con únicamente 5% de datos etiquetados, el modelo supervisado obtuvo mejores resultados que los enfoques semi supervisados, lo cual puede atribuirse a la propagación de errores en las pseudo-etiquetas generadas.
+
+Sin embargo, al incrementar la cantidad de datos etiquetados al 20%, el enfoque de Self-Training combinado con Random Forest alcanzó el mejor desempeño general, superando ligeramente al modelo supervisado tradicional. Esto sugiere que los métodos semi supervisados pueden beneficiarse significativamente de los datos no etiquetados cuando existe una base mínima suficiente de ejemplos correctamente etiquetados.
+
+Por otro lado, el método de Label Propagation presentó un comportamiento estable, aunque ligeramente inferior al Self-Training en la mayoría de escenarios evaluados.
+
+```{r graficas de modelos}
+resultados$porcentaje_etiquetado <- factor(
+  resultados$porcentaje_etiquetado,
+  levels = c("5%", "10%", "20%")
+)
+
+ggplot(resultados, aes(x = porcentaje_etiquetado, y = f1, fill = modelo)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Comparación de modelos supervisados y semi-supervisados",
+    x = "Porcentaje de datos etiquetados",
+    y = "F1-score"
+  ) +
+  theme_minimal()
+```
+
+
