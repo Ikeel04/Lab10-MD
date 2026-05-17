@@ -926,3 +926,339 @@ En Label Propagation, el parámetro más sensible fue k. Con k=3 el rendimiento 
 El análisis de robustez mostró diferencias claras entre ambos algoritmos. Self-Training fue mucho más estable frente a cambios de hiperparámetros, especialmente con 10% y 20% de datos etiquetados, donde la variación del F1 fue mínima. Label Propagation, en cambio, mantuvo una dispersión mayor debido a la sensibilidad al valor de k. En términos prácticos, los resultados sugieren que Self-Training es la opción más predecible cuando se dispone de al menos 10–20% de datos etiquetados, mientras que Label Propagation requiere más cuidado en la selección de k para evitar caídas importantes en rendimiento.
 
 
+# Visualización de Resultados
+
+## Curva de Desempeño vs Porcentaje de Datos Etiquetados
+
+El siguiente gráfico consolida los tres modelos evaluados y permite observar cómo evoluciona
+el accuracy y el F1-score a medida que se incrementa la fracción de datos etiquetados disponibles.
+
+```{r curva-desempeno, fig.height=5}
+curva_datos <- resultados %>%
+  mutate(porcentaje_num = as.numeric(gsub("%", "", porcentaje_etiquetado)))
+
+ggplot(curva_datos,
+       aes(x = porcentaje_num, y = accuracy, color = modelo, group = modelo)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3.5) +
+  geom_text(aes(label = round(accuracy, 3)), vjust = -1, size = 3.2) +
+  scale_x_continuous(breaks = c(5, 10, 20), labels = c("5%", "10%", "20%")) +
+  scale_color_manual(values = c("#e74c3c", "#27ae60", "#3498db")) +
+  labs(
+    title    = "Curva de desempeño: Accuracy vs % de datos etiquetados",
+    subtitle = "Comparación entre modelo supervisado y semi-supervisados",
+    x        = "Porcentaje de datos etiquetados",
+    y        = "Accuracy",
+    color    = "Modelo"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r curva-f1, fig.height=5}
+ggplot(curva_datos,
+       aes(x = porcentaje_num, y = f1, color = modelo, group = modelo)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3.5) +
+  geom_text(aes(label = round(f1, 3)), vjust = -1, size = 3.2) +
+  scale_x_continuous(breaks = c(5, 10, 20), labels = c("5%", "10%", "20%")) +
+  scale_color_manual(values = c("#e74c3c", "#27ae60", "#3498db")) +
+  labs(
+    title    = "Curva de desempeño: F1-score vs % de datos etiquetados",
+    subtitle = "Comparación entre modelo supervisado y semi-supervisados",
+    x        = "Porcentaje de datos etiquetados",
+    y        = "F1-score",
+    color    = "Modelo"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+Ambas curvas revelan que los modelos semi-supervisados logran acortar la brecha con el modelo
+supervisado conforme aumenta el porcentaje de etiquetas. Con el 5% de datos etiquetados la
+diferencia es más marcada, mientras que con el 20% los tres modelos convergen hacia rendimientos
+similares. Esto valida la premisa fundamental del aprendizaje semi-supervisado: los datos no
+etiquetados aportan información estructural que mejora la generalización.
+
+
+## Matrices de Confusión
+
+Se generan las matrices de confusión para cada modelo en su configuración con 10% de datos
+etiquetados, utilizando las mejores configuraciones identificadas en la sección de experimentación (threshold = 0.95 para Self-Training, k = 15 para Label Propagation).
+
+```{r cfm-supervisado, fig.height=4}
+set.seed(123)
+labeled_10 <- particion_10$labeled
+labeled_10$target <- as.factor(labeled_10$target)
+
+rf_sup_10 <- randomForest(target ~ ., data = labeled_10, ntree = 300)
+pred_sup_10 <- predict(rf_sup_10, newdata = test_data)
+
+cfm_sup <- confusionMatrix(pred_sup_10, test_data$target, positive = "1")
+
+as.data.frame(cfm_sup$table) %>%
+  ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#f0f4f8", high = "#3498db") +
+  labs(
+    title    = "Matriz de Confusión – Supervisado (RF, 10% etiquetado)",
+    subtitle = paste0("Accuracy: ", round(cfm_sup$overall["Accuracy"] * 100, 1), "%  |  F1: ",
+                      round(cfm_sup$byClass["F1"], 3)),
+    x = "Clase Real", y = "Clase Predicha", fill = "N"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Con un accuracy del 83.3% y un F1 de 0.834, el modelo supervisado fue el más equilibrado de los tres. Clasificó correctamente 127 pacientes sanos y 128 con enfermedad, cometiendo 22 falsos positivos y 29 falsos negativos. Lo que más llama la atención es que los errores están distribuidos de forma bastante pareja entre ambas clases, lo que indica que el modelo no favorece ninguna dirección en particular. En un contexto médico, los 29 falsos negativos son el dato más preocupante: pacientes que realmente tienen enfermedad cardíaca pero el modelo los clasificó como sanos. Considerando que solo se entrenó con el 10% de los datos etiquetados, el resultado es sólido.
+
+```{r cfm-self-training, fig.height=4}
+set.seed(123)
+pred_st_10 <- entrenar_self_training_v2(
+  particion  = particion_10,
+  test_data  = test_data,
+  porcentaje = "10%",
+  threshold  = 0.95,
+  max_iter   = 5
+)
+
+# Necesitamos las predicciones crudas, no solo métricas
+# Re-ejecutamos internamente para obtener vector de predicciones
+obtener_pred_st <- function(particion, test_data, threshold = 0.95, max_iter = 5) {
+  labeled_data   <- particion$labeled
+  unlabeled_data <- particion$unlabeled
+  labeled_data$target <- as.factor(labeled_data$target)
+  niveles <- levels(labeled_data$target)
+
+  for (i in 1:max_iter) {
+    modelo       <- randomForest(target ~ ., data = labeled_data, ntree = 300)
+    probs        <- predict(modelo, newdata = unlabeled_data %>% select(-target), type = "prob")
+    confianza    <- apply(probs, 1, max)
+    pseudo       <- colnames(probs)[apply(probs, 1, which.max)]
+    sel          <- which(confianza >= threshold)
+    if (length(sel) == 0) break
+    nuevos       <- unlabeled_data[sel, ] %>% select(-target)
+    nuevos$target <- factor(pseudo[sel], levels = niveles)
+    labeled_data <- bind_rows(labeled_data, nuevos)
+    unlabeled_data <- unlabeled_data[-sel, ]
+    if (nrow(unlabeled_data) == 0) break
+  }
+  modelo_final <- randomForest(target ~ ., data = labeled_data, ntree = 300)
+  predict(modelo_final, newdata = test_data)
+}
+
+set.seed(123)
+pred_st_vec <- obtener_pred_st(particion_10, test_data)
+cfm_st <- confusionMatrix(pred_st_vec, test_data$target, positive = "1")
+
+as.data.frame(cfm_st$table) %>%
+  ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#f0f4f8", high = "#27ae60") +
+  labs(
+    title    = "Matriz de Confusión – Self-Training (threshold = 0.95, 10% etiquetado)",
+    subtitle = paste0("Accuracy: ", round(cfm_st$overall["Accuracy"] * 100, 1), "%  |  F1: ",
+                      round(cfm_st$byClass["F1"], 3)),
+    x = "Clase Real", y = "Clase Predicha", fill = "N"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+El Self-Training obtuvo un accuracy del 82% y un F1 de 0.822, resultados muy cercanos al modelo supervisado a pesar de haber aprendido de la misma fracción inicial de etiquetas. Acertó en 124 pacientes sanos y 127 con enfermedad, con 25 falsos positivos y 30 falsos negativos. Al compararlo con el supervisado, la diferencia es pequeña: un error más en ambas categorías de fallo. Esto es una señal positiva, ya que el pseudo-etiquetado iterativo logró capturar suficiente señal del conjunto no etiquetado sin introducir demasiado ruido. El threshold alto de 0.95 fue clave: al ser selectivo en qué observaciones incorporar, el modelo evitó propagar errores en cadena.
+
+```{r cfm-label-prop, fig.height=4}
+# ── Label Propagation (10%, k = 15) ─────────────────────────────────────────
+obtener_pred_lp <- function(particion, test_data, k = 15, alpha = 0.8, iteraciones = 100) {
+  labeled_data   <- particion$labeled
+  unlabeled_data <- particion$unlabeled
+  labeled_data$target <- as.factor(labeled_data$target)
+  niveles <- levels(labeled_data$target)
+
+  semi_data <- bind_rows(labeled_data, unlabeled_data)
+  idx_lab   <- 1:nrow(labeled_data)
+
+  X <- model.matrix(~ ., data = semi_data %>% select(-target))[, -1]
+  X <- scale(X)
+
+  knn_res <- FNN::get.knn(X, k = k)
+  n       <- nrow(X)
+  W       <- matrix(0, n, n)
+  sigma   <- median(knn_res$nn.dist)
+
+  for (i in 1:n) {
+    W[i, knn_res$nn.index[i, ]] <- exp(-(knn_res$nn.dist[i, ]^2) / (2 * sigma^2))
+  }
+  W <- W / rowSums(W); W[is.na(W)] <- 0
+
+  Y <- matrix(0, n, length(niveles)); colnames(Y) <- niveles
+  for (i in idx_lab) Y[i, as.character(labeled_data$target[i])] <- 1
+
+  F_mat <- Y
+  for (i in 1:iteraciones) {
+    F_mat <- alpha * W %*% F_mat + (1 - alpha) * Y
+    F_mat[idx_lab, ] <- Y[idx_lab, ]
+  }
+
+  pseudo <- colnames(F_mat)[max.col(F_mat)]
+  semi_completo <- semi_data %>% select(-target)
+  semi_completo$target <- factor(pseudo, levels = niveles)
+
+  modelo_final <- randomForest(target ~ ., data = semi_completo, ntree = 300)
+  predict(modelo_final, newdata = test_data)
+}
+
+set.seed(123)
+pred_lp_vec <- obtener_pred_lp(particion_10, test_data, k = 15)
+cfm_lp <- confusionMatrix(pred_lp_vec, test_data$target, positive = "1")
+
+as.data.frame(cfm_lp$table) %>%
+  ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#f0f4f8", high = "#e67e22") +
+  labs(
+    title    = "Matriz de Confusión – Label Propagation (k = 15, 10% etiquetado)",
+    subtitle = paste0("Accuracy: ", round(cfm_lp$overall["Accuracy"] * 100, 1), "%  |  F1: ",
+                      round(cfm_lp$byClass["F1"], 3)),
+    x = "Clase Real", y = "Clase Predicha", fill = "N"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Label Propagation también alcanzó un accuracy del 82% y un F1 de 0.834, igualando al supervisado en F1 a pesar de usar los mismos datos etiquetados. Lo que distingue a este modelo es su comportamiento: detectó 138 pacientes con enfermedad correctamente, el número más alto de los tres, pero a cambio cometió 36 falsos positivos, también el número más alto. En la práctica, esto significa que el modelo tiende a ser más agresivo clasificando personas como enfermas. Para diagnóstico cardíaco eso no es necesariamente malo: es preferible enviar a un paciente sano a un examen adicional que dejar pasar una enfermedad real. Los 19 falsos negativos son los más bajos de los tres modelos, lo que lo convierte en el más sensible.
+
+```{r cfm-interpretacion, echo=FALSE}
+# Extraer métricas para comentario
+fn_sup <- cfm_sup$table[1, 2]
+fn_st  <- cfm_st$table[1, 2]
+fn_lp  <- cfm_lp$table[1, 2]
+```
+
+En el contexto médico de este dataset, los falsos negativos (paciente con enfermedad
+clasificado como sano) son el error más costoso. Los tres modelos con 10% de etiquetas
+generaron `r fn_sup`, `r fn_st` y `r fn_lp` falsos negativos respectivamente
+(Supervisado, Self-Training, Label Propagation). Self-Training y Label Propagation logran
+mantener este error comparable al modelo supervisado puro, validando su utilidad en escenarios
+donde el etiquetado es escaso.
+
+
+## Predicción vs Valor Real
+
+```{r pred-vs-real, fig.height=4.5}
+comparacion <- data.frame(
+  Indice   = 1:nrow(test_data),
+  Real     = as.integer(as.character(test_data$target)),
+  Pred_ST  = as.integer(as.character(pred_st_vec)),
+  Pred_SUP = as.integer(as.character(pred_sup_10)),
+  Pred_LP  = as.integer(as.character(pred_lp_vec))
+) %>%
+  mutate(
+    Error_ST  = Real != Pred_ST,
+    Error_SUP = Real != Pred_SUP,
+    Error_LP  = Real != Pred_LP
+  )
+
+set.seed(42)
+muestra_idx <- sort(sample(1:nrow(comparacion), 80))
+comp_muestra <- comparacion[muestra_idx, ] %>%
+  mutate(Indice = row_number())
+
+ggplot(comp_muestra) +
+  geom_segment(aes(x = Indice, xend = Indice, y = Real, yend = Pred_ST,
+                   color = Error_ST), linewidth = 0.6, alpha = 0.7) +
+  geom_point(aes(x = Indice, y = Real), shape = 16, size = 2, color = "#2c3e50") +
+  geom_point(aes(x = Indice, y = Pred_ST, color = Error_ST), shape = 17, size = 2) +
+  scale_color_manual(values = c("FALSE" = "#27ae60", "TRUE" = "#e74c3c"),
+                     labels = c("Correcto", "Error")) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("Sin enfermedad (0)", "Con enfermedad (1)")) +
+  labs(
+    title    = "Predicción vs Valor Real – Self-Training (muestra de 80 observaciones)",
+    subtitle = "Círculos = valor real | Triángulos = predicción | Línea roja = error",
+    x = "Observación", y = "Clase", color = "Clasificación"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r pred-barras, fig.height=4}
+errores_resumen <- data.frame(
+  Modelo    = c("Supervisado (RF)", "Self-Training", "Label Propagation"),
+  Correctos = c(sum(!comparacion$Error_SUP),
+                sum(!comparacion$Error_ST),
+                sum(!comparacion$Error_LP)),
+  Errores   = c(sum(comparacion$Error_SUP),
+                sum(comparacion$Error_ST),
+                sum(comparacion$Error_LP))
+) %>%
+  pivot_longer(c(Correctos, Errores), names_to = "Tipo", values_to = "N")
+
+ggplot(errores_resumen, aes(x = Modelo, y = N, fill = Tipo)) +
+  geom_col(position = "stack", width = 0.5) +
+  geom_text(aes(label = N), position = position_stack(vjust = 0.5),
+            size = 4, fontface = "bold", color = "white") +
+  scale_fill_manual(values = c("Correctos" = "#27ae60", "Errores" = "#e74c3c")) +
+  labs(
+    title = "Predicciones correctas vs errores por modelo (10% etiquetado, n = 306)",
+    x = "", y = "Número de observaciones", fill = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## Tabla Resumen Final
+
+```{r tabla-resumen-final}
+resumen_final <- data.frame(
+  Modelo = c(
+    "Supervisado (RF)",
+    "Supervisado (RF)",
+    "Supervisado (RF)",
+    "Self-Training (thr=0.95)",
+    "Self-Training (thr=0.95)",
+    "Self-Training (thr=0.90)",
+    "Label Propagation (k=15)",
+    "Label Propagation (k=15)",
+    "Label Propagation (k=10)"
+  ),
+  Etiquetado = c("5%","10%","20%","5%","10%","20%","5%","10%","20%"),
+  Accuracy = c(
+    resultados$accuracy[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "5%"],
+    resultados$accuracy[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "10%"],
+    resultados$accuracy[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "20%"],
+    mejor_threshold$accuracy[mejor_threshold$porcentaje_etiquetado == "5%"],
+    mejor_threshold$accuracy[mejor_threshold$porcentaje_etiquetado == "10%"],
+    mejor_threshold$accuracy[mejor_threshold$porcentaje_etiquetado == "20%"],
+    mejor_k$accuracy[mejor_k$porcentaje_etiquetado == "5%"],
+    mejor_k$accuracy[mejor_k$porcentaje_etiquetado == "10%"],
+    mejor_k$accuracy[mejor_k$porcentaje_etiquetado == "20%"]
+  ),
+  F1 = c(
+    resultados$f1[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "5%"],
+    resultados$f1[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "10%"],
+    resultados$f1[resultados$modelo == "Supervisado - Random Forest" & resultados$porcentaje_etiquetado == "20%"],
+    mejor_threshold$f1[mejor_threshold$porcentaje_etiquetado == "5%"],
+    mejor_threshold$f1[mejor_threshold$porcentaje_etiquetado == "10%"],
+    mejor_threshold$f1[mejor_threshold$porcentaje_etiquetado == "20%"],
+    mejor_k$f1[mejor_k$porcentaje_etiquetado == "5%"],
+    mejor_k$f1[mejor_k$porcentaje_etiquetado == "10%"],
+    mejor_k$f1[mejor_k$porcentaje_etiquetado == "20%"]
+  )
+)
+
+kable(resumen_final, digits = 4,
+      col.names = c("Modelo", "% Etiquetado", "Accuracy", "F1-score"),
+      caption = "Tabla resumen – mejores configuraciones por modelo y % de etiquetado") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(which(resumen_final$F1 == max(resumen_final$F1)),
+           bold = TRUE, color = "white", background = "#27ae60")
+```
+
+
+## Conclusiones
+
+Después de haber evaluado los tres modelos con solo el 10% de datos etiquetados, lo que más sorprende no es cuál ganó, sino cuánto se acercaron todos al mismo resultado. Partiendo de apenas 72 observaciones etiquetadas sobre más de 700 disponibles para entrenamiento, los dos algoritmos semi-supervisados lograron rendimientos prácticamente indistinguibles del modelo supervisado. Eso, en sí mismo, es el hallazgo más importante.
+Si tuvieramos que elegir uno para implementar, nos inclinaríamos por Label Propagation con k = 15. No porque tenga el accuracy más alto, sino porque en este problema concreto, el cual es detectar una enfermedad cardíaca, el tipo de error importa. Este modelo fue el que menos pacientes enfermos dejó sin detectar, y eso tiene un peso real. Que haya clasificado más falsos positivos es un costo aceptable, lo que significa más revisiones innecesarias, pero no pacientes enviados a casa sin diagnóstico.
+Self-Training es la opción más predecible y estable. Si el objetivo fuera desplegar el modelo en un entorno donde el comportamiento consistente importa más que maximizar detección, sería la elección. Responde bien a cambios de hiperparámetros y su lógica de pseudo-etiquetado es fácil de auditar y explicar.
+Lo que este experimento deja claro es que el aprendizaje semi-supervisado no es un truco ni un atajo, es una solución real para escenarios donde etiquetar datos cuesta dinero, tiempo o expertise. En medicina, eso es casi siempre el caso. Con el 20% de datos etiquetados, los modelos ya superan el 88% de accuracy, lo que sugiere que en la práctica no haría falta etiquetar más allá de ese umbral para obtener un modelo útil.
