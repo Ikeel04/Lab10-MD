@@ -580,5 +580,349 @@ ggplot(resultados, aes(x = porcentaje_etiquetado, y = f1, fill = modelo)) +
   ) +
   theme_minimal()
 ```
+# Experimentación
+```{r}
+#Variación de hiperparámetros
+
+#Self-Training: variación de threshold
+thresholds <- c(0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+porcentajes <- list("5%" = particion_5, "10%" = particion_10, "20%" = particion_20)
+
+resultados_threshold <- bind_rows(lapply(thresholds, function(thr) {
+  bind_rows(lapply(names(porcentajes), function(pct) {
+    res <- entrenar_self_training_v2(
+      particion  = porcentajes[[pct]],
+      test_data  = test_data,
+      porcentaje = pct,
+      threshold  = thr,
+      max_iter   = 5
+    )
+    res$threshold <- thr
+    res
+  }))
+}))
+
+#Label Propagation: variación de k (vecinos) y alpha
+k_values     <- c(3, 5, 7, 10, 15)
+alpha_values <- c(0.5, 0.6, 0.7, 0.8, 0.9)
+
+resultados_k <- bind_rows(lapply(k_values, function(k) {
+  bind_rows(lapply(names(porcentajes), function(pct) {
+    res <- entrenar_label_propagation(
+      particion  = porcentajes[[pct]],
+      test_data  = test_data,
+      porcentaje = pct,
+      k          = k,
+      alpha      = 0.8,
+      iteraciones = 100
+    )
+    res$k     <- k
+    res$alpha <- 0.8
+    res
+  }))
+}))
+
+resultados_alpha <- bind_rows(lapply(alpha_values, function(a) {
+  bind_rows(lapply(names(porcentajes), function(pct) {
+    res <- entrenar_label_propagation(
+      particion  = porcentajes[[pct]],
+      test_data  = test_data,
+      porcentaje = pct,
+      k          = 7,
+      alpha      = a,
+      iteraciones = 100
+    )
+    res$k     <- 7
+    res$alpha <- a
+    res
+  }))
+}))
+
+#Random Forest supervisado: variación de ntree
+ntree_values <- c(50, 100, 200, 300, 500)
+
+resultados_ntree <- bind_rows(lapply(ntree_values, function(nt) {
+  bind_rows(lapply(names(porcentajes), function(pct) {
+    labeled_data        <- porcentajes[[pct]]$labeled
+    labeled_data$target <- as.factor(labeled_data$target)
+    modelo              <- randomForest(target ~ ., data = labeled_data, ntree = nt)
+    predicciones        <- predict(modelo, newdata = test_data)
+    res <- evaluar_modelo(predicciones, test_data$target,
+                          "Supervisado - Random Forest", pct)
+    res$ntree <- nt
+    res
+  }))
+}))
+```
+
+Para entender cómo cambiaba el rendimiento de cada modelo, se probaron distintos valores en los hiperparámetros más importantes.
+
+Self-Training — Threshold de confianza
+Se evaluaron valores entre 0.65 y 0.95. Un threshold bajo permite agregar más pseudo-etiquetas, pero aumenta el riesgo de errores.
+
+Label Propagation — Número de vecinos (k)
+Se probaron valores k∈{3,5,7,10,15} con α=0.8. Un k pequeño hace que la propagación sea muy local, mientras que uno grande conecta más nodos pero puede mezclar clases distintas.
+
+Label Propagation — Alpha (α)
+Se evaluaron valores α∈{0.5,0.6,0.7,0.8,0.9} usando k=7. Alpha controla cuánto peso tienen las etiquetas propagadas frente a las originales.
+
+Random Forest supervisado — Número de árboles (ntree)
+Se probaron valores entre 50 y 500 árboles. Más árboles suelen dar predicciones más estables, aunque aumentan el tiempo de entrenamiento.
+
+```{r}
+#Visualización de métricas por hiperparámetro
+#Curva F1 vs Threshold (Self-Training)
+resultados_threshold$porcentaje_etiquetado <- factor(
+  resultados_threshold$porcentaje_etiquetado, levels = c("5%", "10%", "20%")
+)
+
+ggplot(resultados_threshold,
+       aes(x = threshold, y = f1, color = porcentaje_etiquetado, group = porcentaje_etiquetado)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#e74c3c", "#f39c12", "#27ae60")) +
+  labs(
+    title    = "Self-Training: F1-score según threshold de confianza",
+    subtitle = "Por porcentaje de datos etiquetados",
+    x        = "Threshold de confianza",
+    y        = "F1-score",
+    color    = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Curva Accuracy vs Threshold (Self-Training)
+ggplot(resultados_threshold,
+       aes(x = threshold, y = accuracy, color = porcentaje_etiquetado, group = porcentaje_etiquetado)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#e74c3c", "#f39c12", "#27ae60")) +
+  labs(
+    title  = "Self-Training: Accuracy según threshold de confianza",
+    x      = "Threshold de confianza",
+    y      = "Accuracy",
+    color  = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Curva F1 vs k (Label Propagation)
+resultados_k$porcentaje_etiquetado <- factor(
+  resultados_k$porcentaje_etiquetado, levels = c("5%", "10%", "20%")
+)
+
+ggplot(resultados_k,
+       aes(x = k, y = f1, color = porcentaje_etiquetado, group = porcentaje_etiquetado)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = k_values) +
+  scale_color_manual(values = c("#e74c3c", "#f39c12", "#27ae60")) +
+  labs(
+    title    = "Label Propagation: F1-score según número de vecinos (k)",
+    subtitle = "Alpha fijo = 0.8",
+    x        = "Número de vecinos k",
+    y        = "F1-score",
+    color    = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Curva F1 vs Alpha (Label Propagation)
+resultados_alpha$porcentaje_etiquetado <- factor(
+  resultados_alpha$porcentaje_etiquetado, levels = c("5%", "10%", "20%")
+)
+
+ggplot(resultados_alpha,
+       aes(x = alpha, y = f1, color = porcentaje_etiquetado, group = porcentaje_etiquetado)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#e74c3c", "#f39c12", "#27ae60")) +
+  labs(
+    title    = "Label Propagation: F1-score según alpha (tasa de propagación)",
+    subtitle = "k fijo = 7",
+    x        = "Alpha",
+    y        = "F1-score",
+    color    = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Curva F1 vs ntree (Random Forest supervisado)
+resultados_ntree$porcentaje_etiquetado <- factor(
+  resultados_ntree$porcentaje_etiquetado, levels = c("5%", "10%", "20%")
+)
+
+ggplot(resultados_ntree,
+       aes(x = ntree, y = f1, color = porcentaje_etiquetado, group = porcentaje_etiquetado)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#e74c3c", "#f39c12", "#27ae60")) +
+  labs(
+    title  = "Random Forest supervisado: F1-score según número de árboles",
+    x      = "Número de árboles (ntree)",
+    y      = "F1-score",
+    color  = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Precision por modelo y porcentaje
+ggplot(resultados, aes(x = porcentaje_etiquetado, y = precision, fill = modelo)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#e74c3c", "#27ae60", "#3498db")) +
+  labs(
+    title = "Comparación de Precision por modelo",
+    x = "Porcentaje de datos etiquetados",
+    y = "Precision"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Recall por modelo y porcentaje
+ggplot(resultados, aes(x = porcentaje_etiquetado, y = recall, fill = modelo)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#e74c3c", "#27ae60", "#3498db")) +
+  labs(
+    title = "Comparación de Recall por modelo",
+    x = "Porcentaje de datos etiquetados",
+    y = "Recall"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+En Self-Training, el modelo fue bastante estable cuando había 20% de datos etiquetados, independientemente del threshold. Con 10% apareció una caída alrededor de 0.75, probablemente por la incorporación de pseudo-etiquetas incorrectas. El caso más sensible fue el 5%, donde thresholds bajos redujeron mucho el rendimiento, mientras que valores altos como 0.90 y 0.95 ayudaron a mantener mejores resultados. Esto sugiere que, con pocos datos etiquetados, conviene usar thresholds más estrictos para evitar propagar errores.
+
+En Label Propagation, el parámetro k tuvo más impacto que alpha. Con valores bajos de k la propagación fue limitada y el rendimiento cayó, mientras que desde k=7 las mejoras ya fueron pequeñas, por lo que representó un buen balance. En cambio, alpha mostró un comportamiento más estable; los mejores resultados aparecieron alrededor de 0.6 y 0.7, aunque las diferencias no fueron muy grandes.
+
+Para Random Forest, el modelo funcionó bien incluso con pocos árboles, pero con solo 5% de datos etiquetados hubo bastante variabilidad. Al aumentar el número de árboles, el rendimiento se estabilizó, especialmente a partir de 400 árboles.
+
+La métrica de precision mostró que Random Forest fue el modelo más confiable en todos los escenarios. Entre los semi-supervisados, Self-Training obtuvo mejores resultados que Label Propagation, especialmente con pocos datos etiquetados, probablemente porque usa pseudo-etiquetas más conservadoras.
+
+En recall ocurrió lo contrario: Label Propagation detectó más casos positivos reales, aunque con menor precision. Esto puede ser útil en un contexto médico, donde es más importante evitar pasar por alto una enfermedad que reducir algunos falsos positivos.
+
+```{r}
+#Análisis de sensibilidad a hiperparámetros
+
+# Heatmap: F1 por threshold × % etiquetado (Self-Training)
+ggplot(resultados_threshold,
+       aes(x = factor(threshold), y = porcentaje_etiquetado, fill = f1)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(f1, 3)), size = 3.5) +
+  scale_fill_gradient2(
+    low      = "#e74c3c",
+    mid      = "#f9e79f",
+    high     = "#27ae60",
+    midpoint = median(resultados_threshold$f1, na.rm = TRUE)
+  ) +
+  labs(
+    title = "Sensibilidad del Self-Training al threshold de confianza",
+    x     = "Threshold",
+    y     = "% Datos etiquetados",
+    fill  = "F1-score"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Heatmap: F1 por k × % etiquetado (Label Propagation)
+ggplot(resultados_k,
+       aes(x = factor(k), y = porcentaje_etiquetado, fill = f1)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(f1, 3)), size = 3.5) +
+  scale_fill_gradient2(
+    low      = "#e74c3c",
+    mid      = "#f9e79f",
+    high     = "#27ae60",
+    midpoint = median(resultados_k$f1, na.rm = TRUE)
+  ) +
+  labs(
+    title = "Sensibilidad del Label Propagation al número de vecinos k",
+    x     = "k (vecinos)",
+    y     = "% Datos etiquetados",
+    fill  = "F1-score"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Heatmap: F1 por alpha × % etiquetado (Label Propagation)
+ggplot(resultados_alpha,
+       aes(x = factor(alpha), y = porcentaje_etiquetado, fill = f1)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(f1, 3)), size = 3.5) +
+  scale_fill_gradient2(
+    low      = "#e74c3c",
+    mid      = "#f9e79f",
+    high     = "#27ae60",
+    midpoint = median(resultados_alpha$f1, na.rm = TRUE)
+  ) +
+  labs(
+    title = "Sensibilidad del Label Propagation al parámetro alpha",
+    x     = "Alpha",
+    y     = "% Datos etiquetados",
+    fill  = "F1-score"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Tabla resumen: mejor configuración por modelo y porcentaje
+mejor_threshold <- resultados_threshold %>%
+  group_by(porcentaje_etiquetado) %>%
+  slice_max(f1, n = 1) %>%
+  select(porcentaje_etiquetado, threshold, accuracy, f1, recall) %>%
+  rename(mejor_hiperparametro = threshold)
+
+mejor_k <- resultados_k %>%
+  group_by(porcentaje_etiquetado) %>%
+  slice_max(f1, n = 1) %>%
+  select(porcentaje_etiquetado, k, accuracy, f1, recall) %>%
+  rename(mejor_hiperparametro = k)
+
+cat("=== Mejor threshold por % etiquetado (Self-Training) ===\n")
+print(mejor_threshold)
+
+cat("\n=== Mejor k por % etiquetado (Label Propagation) ===\n")
+print(mejor_k)
+
+# Varianza del F1 por modelo: mide robustez ante cambios de hiperparámetro
+robustez <- bind_rows(
+  resultados_threshold %>%
+    group_by(porcentaje_etiquetado) %>%
+    summarise(
+      modelo       = "Self-Training",
+      f1_media     = round(mean(f1, na.rm = TRUE), 4),
+      f1_sd        = round(sd(f1,   na.rm = TRUE), 4),
+      f1_min       = round(min(f1,  na.rm = TRUE), 4),
+      f1_max       = round(max(f1,  na.rm = TRUE), 4),
+      rango_f1     = round(f1_max - f1_min, 4)
+    ),
+  resultados_k %>%
+    group_by(porcentaje_etiquetado) %>%
+    summarise(
+      modelo       = "Label Propagation (k)",
+      f1_media     = round(mean(f1, na.rm = TRUE), 4),
+      f1_sd        = round(sd(f1,   na.rm = TRUE), 4),
+      f1_min       = round(min(f1,  na.rm = TRUE), 4),
+      f1_max       = round(max(f1,  na.rm = TRUE), 4),
+      rango_f1     = round(f1_max - f1_min, 4)
+    )
+)
+
+cat("\n=== Análisis de robustez (varianza del F1 ante cambios de hiperparámetro) ===\n")
+kable(robustez, caption = "Robustez de modelos ante variación de hiperparámetros") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+#Gráfico de robustez: boxplot de F1 por modelo y porcentaje
+bind_rows(
+  resultados_threshold %>% mutate(experimento = "Self-Training\n(threshold)"),
+  resultados_k         %>% mutate(experimento = "Label Propagation\n(k vecinos)")
+) %>%
+  mutate(porcentaje_etiquetado = factor(porcentaje_etiquetado, levels = c("5%","10%","20%"))) %>%
+  ggplot(aes(x = porcentaje_etiquetado, y = f1, fill = experimento)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 21) +
+  scale_fill_manual(values = c("#3498db", "#e67e22")) +
+  labs(
+    title    = "Robustez ante variación de hiperparámetros",
+    subtitle = "Distribución del F1-score según % de datos etiquetados",
+    x        = "% Datos etiquetados",
+    y        = "F1-score",
+    fill     = "Modelo"
+  ) +
+  theme_minimal(base_size = 13)
+```
+Los heatmaps confirmaron varias de las tendencias observadas anteriormente. En Self-Training, el peor rendimiento apareció con solo 5% de datos etiquetados y thresholds bajos, donde el modelo incorporó demasiadas pseudo-etiquetas incorrectas. A medida que el threshold aumentó, el desempeño mejoró y se volvió mucho más estable. En cambio, con 20% de etiquetado el modelo prácticamente no cambió entre configuraciones, lo que indica que el threshold deja de ser tan crítico cuando hay suficiente información inicial.
+
+En Label Propagation, el parámetro más sensible fue k. Con k=3 el rendimiento cayó fuertemente en todos los escenarios, mostrando que un grafo demasiado disperso no permite propagar bien las etiquetas. El mayor salto de mejora ocurrió al pasar de k=3 a k=5, mientras que desde k=7 las mejoras fueron menores. En general, valores entre 10 y 15 dieron los mejores resultados. Por otro lado, alpha mostró mucha menos variación; el modelo se mantuvo relativamente estable y los mejores resultados aparecieron cerca de α=0.6.
+
+El análisis de robustez mostró diferencias claras entre ambos algoritmos. Self-Training fue mucho más estable frente a cambios de hiperparámetros, especialmente con 10% y 20% de datos etiquetados, donde la variación del F1 fue mínima. Label Propagation, en cambio, mantuvo una dispersión mayor debido a la sensibilidad al valor de k. En términos prácticos, los resultados sugieren que Self-Training es la opción más predecible cuando se dispone de al menos 10–20% de datos etiquetados, mientras que Label Propagation requiere más cuidado en la selección de k para evitar caídas importantes en rendimiento.
 
 
